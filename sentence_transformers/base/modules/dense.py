@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Callable
+from itertools import chain
 from typing import Any
 
 try:
@@ -10,6 +11,7 @@ try:
 except ImportError:
     from typing_extensions import Self
 
+import torch
 from torch import Tensor, nn
 
 from sentence_transformers.base.modules.module import Module
@@ -39,6 +41,14 @@ class Dense(Module):
         use_residual: If True, add a residual connection from the input to the projected output.
             When ``in_features != out_features``, the residual is projected through a separate
             ``nn.Linear(in_features, out_features, bias=False)``. Defaults to False.
+        compute_dtype: Optional dtype for the projection, activation, and residual connection,
+            independent of the backbone dtype. Accepts ``torch.float32`` or a string such as
+            ``"float32"`` (also ``float16``, ``bfloat16``, and ``float64``). When set, inputs and
+            projection weights are cast to this dtype and autocast is disabled inside this module.
+            Model loading keeps this module's parameters in the requested dtype. Explicit later
+            calls such as ``model.bfloat16()`` can still change stored parameters; promoting them
+            during computation cannot recover precision lost by such a cast. Defaults to None,
+            which preserves the model's usual dtype and autocast behavior.
     """
 
     config_keys: list[str] = [
@@ -49,10 +59,12 @@ class Dense(Module):
         "module_input_name",
         "module_output_name",
         "use_residual",
+        "compute_dtype",
     ]
     # Keys at their default are omitted on save so pre-5.7 releases (no unknown-key dropping) can load new saves.
-    _DEFAULT_CONFIG_VALUES: dict[str, bool] = {
+    _DEFAULT_CONFIG_VALUES: dict[str, bool | None] = {
         "use_residual": False,
+        "compute_dtype": None,
     }
 
     def __init__(
@@ -66,33 +78,70 @@ class Dense(Module):
         module_input_name: str = "sentence_embedding",
         module_output_name: str | None = None,
         use_residual: bool = False,
+        compute_dtype: torch.dtype | str | None = None,
     ):
         super().__init__()
+        if isinstance(compute_dtype, str):
+            compute_dtype = getattr(torch, compute_dtype, None)
+            if compute_dtype is None:
+                raise ValueError("compute_dtype must be float16, bfloat16, float32, float64, or None.")
+        if compute_dtype not in (None, torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            raise ValueError("compute_dtype must be float16, bfloat16, float32, float64, or None.")
+        self.compute_dtype = compute_dtype
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
         self.activation_function = nn.Identity() if activation_function is None else activation_function
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.linear = nn.Linear(in_features, out_features, bias=bias, dtype=compute_dtype)
         self.module_input_name = module_input_name
         self.module_output_name = module_output_name if module_output_name is not None else module_input_name
         self.use_residual = use_residual
         if use_residual and in_features != out_features:
-            self.residual = nn.Linear(in_features, out_features, bias=False)
+            self.residual = nn.Linear(in_features, out_features, bias=False, dtype=compute_dtype)
 
         if init_weight is not None:
             self.linear.weight = nn.Parameter(init_weight)
 
         if init_bias is not None and bias:
             self.linear.bias = nn.Parameter(init_bias)
+        if compute_dtype is not None:
+            self.to(dtype=compute_dtype)
 
     def forward(self, features: dict[str, Tensor]):
         x = features[self.module_input_name]
-        out = self.activation_function(self.linear(x))
-        if self.use_residual:
-            residual = x if self.in_features == self.out_features else self.residual(x)
-            out = out + residual
+        if self.compute_dtype is None:
+            out = self.activation_function(self.linear(x))
+            if self.use_residual:
+                residual = x if self.in_features == self.out_features else self.residual(x)
+                out = out + residual
+        else:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                x = x.to(self.compute_dtype)
+                out = self._forward_in_compute_dtype(
+                    self.activation_function, self._forward_in_compute_dtype(self.linear, x)
+                )
+                if self.use_residual:
+                    residual = (
+                        x
+                        if self.in_features == self.out_features
+                        else self._forward_in_compute_dtype(self.residual, x)
+                    )
+                    out = out + residual
         features[self.module_output_name] = out
         return features
+
+    def _forward_in_compute_dtype(self, module: Callable[[Tensor], Tensor], inputs: Tensor) -> Tensor:
+        if isinstance(module, nn.Module):
+            state = {
+                name: tensor.to(self.compute_dtype)
+                for name, tensor in chain(module.named_parameters(), module.named_buffers())
+                if tensor.is_floating_point() and tensor.dtype != self.compute_dtype
+            }
+            if state:
+                # Preserve the module's forward and hooks, including parameterized activations.
+                # Casting the tensors remains differentiable without mutating stored parameters.
+                return torch.func.functional_call(module, state, (inputs,))
+        return module(inputs)
 
     def get_embedding_dimension(self) -> int:
         return self.out_features
@@ -100,6 +149,8 @@ class Dense(Module):
     def get_config_dict(self):
         config = super().get_config_dict()
         config["activation_function"] = fullname(self.activation_function)
+        if self.compute_dtype is not None:
+            config["compute_dtype"] = str(self.compute_dtype).removeprefix("torch.")
         for key, default in self._DEFAULT_CONFIG_VALUES.items():
             if config.get(key) == default:
                 config.pop(key, None)

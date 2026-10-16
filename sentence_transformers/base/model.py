@@ -14,7 +14,7 @@ import traceback
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from functools import cached_property
+from functools import cached_property, partial
 from itertools import chain
 from multiprocessing import Queue
 from pathlib import Path
@@ -42,7 +42,7 @@ from sentence_transformers.base.evaluation import BaseEvaluator
 from sentence_transformers.base.modality import infer_batch_modality, is_message_dict, raise_unsupported_modality_error
 from sentence_transformers.base.modality_types import Modality, PairInput, SingleInput
 from sentence_transformers.base.model_card import BaseModelCardData, generate_model_card
-from sentence_transformers.base.modules import Module, Router, Transformer
+from sentence_transformers.base.modules import Dense, Module, Router, Transformer
 from sentence_transformers.base.peft_mixin import PeftAdapterMixin
 from sentence_transformers.util import (
     _move_tensors_to_cpu,
@@ -283,7 +283,7 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
             first_param = next(self[0].parameters(), None)
             if first_param is not None:
                 for module in list(self.children())[1:]:
-                    module.to(first_param.dtype)
+                    self._cast_module_dtype(module, first_param.dtype)
             self.to(device)
         self.is_hpu_graph_enabled = False
 
@@ -1541,6 +1541,23 @@ This pull request has been automatically generated to add {self.__class__.__name
                 except TypeError:
                     module.gradient_checkpointing_enable()
 
+    @staticmethod
+    def _cast_module_dtype(module: nn.Module, dtype: torch.dtype) -> None:
+        """Align a module with the backbone while respecting configured Dense precision."""
+        if isinstance(module, Dense) and module.compute_dtype is not None:
+            module.to(module.compute_dtype)
+        elif any(isinstance(child, Dense) and child.compute_dtype is not None for child in module.modules()):
+            # A container can hold both ordinary modules and a Dense with its own dtype.
+            # Casting the whole container first would irreversibly round the Dense weights.
+            for child in module.children():
+                BaseModel._cast_module_dtype(child, dtype)
+            module._apply(
+                lambda tensor: tensor.to(dtype) if tensor.is_floating_point() or tensor.is_complex() else tensor,
+                recurse=False,
+            )
+        else:
+            module.to(dtype)
+
     def _place_modules(self) -> None:
         """Align auxiliary modules without changing backbones or dispatched submodules."""
         device = self.device
@@ -1548,6 +1565,12 @@ This pull request has been automatically generated to add {self.__class__.__name
         dtype = first_param.dtype if first_param is not None else None
         modules = list(self.modules())
         protected: set[nn.Module] = set()
+        dtype_overrides = {
+            child: module.compute_dtype
+            for module in modules
+            if isinstance(module, Dense) and module.compute_dtype is not None
+            for child in module.modules()
+        }
 
         def collect_hook(module: nn.Module, hook: ModelHook | None) -> None:
             if getattr(hook, "execution_device", None) is not None:
@@ -1565,15 +1588,18 @@ This pull request has been automatically generated to add {self.__class__.__name
                 protected.update(module.modules())
             collect_hook(module, module.__dict__.get("_hf_hook"))
 
-        def convert(tensor: Tensor) -> Tensor:
-            return tensor.to(device=device, dtype=dtype if tensor.is_floating_point() or tensor.is_complex() else None)
+        def convert(tensor: Tensor, target_dtype: torch.dtype | None) -> Tensor:
+            return tensor.to(
+                device=device, dtype=target_dtype if tensor.is_floating_point() or tensor.is_complex() else None
+            )
 
         for module in reversed(modules):
             if module not in protected:
+                convert_module = partial(convert, target_dtype=dtype_overrides.get(module, dtype))
                 if isinstance(module, BaseModel):
-                    super(BaseModel, module)._apply(convert, recurse=False)
+                    super(BaseModel, module)._apply(convert_module, recurse=False)
                 else:
-                    module._apply(convert, recurse=False)
+                    module._apply(convert_module, recurse=False)
 
     @torch.inference_mode(False)
     def _resolve_inference_device(self, device: int | str | torch.device | None) -> torch.device:

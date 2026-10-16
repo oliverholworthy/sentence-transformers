@@ -98,6 +98,41 @@ Because most causal language models (LM) tie input embeddings with the LM head w
 
    See the `multimodal training examples <https://github.com/UKPLab/sentence-transformers/tree/master/examples/cross_encoder/training/multimodal>`_ for a complete comparison of the Text Generation + LogitScore and Feature Extraction + Pooling + Dense approaches.
 
+Scoring Precision
+^^^^^^^^^^^^^^^^^
+
+For a Feature Extraction + Pooling + Dense model, the backbone and scoring projection can
+use different precision. Set ``compute_dtype="float32"`` on the scoring Dense to compute
+the projection in FP32 while the backbone runs in BF16 or FP16:
+
+.. code-block:: python
+
+   dense = Dense(
+       in_features=transformer.get_embedding_dimension(),
+       out_features=1,
+       bias=False,
+       activation_function=None,
+       init_weight=init_weight,
+       module_output_name="scores",
+       compute_dtype="float32",
+   )
+   model = CrossEncoder(modules=[transformer, pooling, dense])
+
+The Dense casts its input and projection weights to the requested dtype and disables
+autocast within its forward pass. Casting the returned scores to FP32 after a low-precision
+projection cannot recover distinctions already rounded away by that projection.
+
+The setting is saved as ``"compute_dtype": "float32"`` in the Dense module's ``config.json``.
+Loading the model preserves that module's parameter precision, including when a
+``device_map`` places the backbone. The backbone and Pooling configuration are unchanged.
+Leaving ``compute_dtype`` unset preserves the usual behavior of matching the backbone dtype.
+
+An explicit later call such as ``model.bfloat16()`` still casts stored parameters. The
+projection uses its configured compute dtype, but cannot recover precision lost when
+the weights were cast. Prefer choosing the backbone dtype through ``model_kwargs`` during
+loading. Loading this configuration requires a Sentence Transformers version that supports
+``compute_dtype``; older versions may ignore the setting or reject it.
+
 Constructing Custom Module Chains
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
