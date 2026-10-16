@@ -118,19 +118,22 @@ the projection in FP32 while the backbone runs in BF16 or FP16:
    )
    model = CrossEncoder(modules=[transformer, pooling, dense])
 
-The Dense casts its input and projection weights to the requested dtype and disables
-autocast within its forward pass. Casting the returned scores to FP32 after a low-precision
-projection cannot recover distinctions already rounded away by that projection.
+The Dense keeps its parameters in the requested dtype, casts its input, and disables
+autocast within its forward pass. Its output also uses the requested dtype. Casting the
+returned scores to FP32 after a low-precision projection cannot recover distinctions
+already rounded away by that projection. If another module follows the Dense, it must
+accept that output dtype.
 
 The setting is saved as ``"compute_dtype": "float32"`` in the Dense module's ``config.json``.
 Loading the model preserves that module's parameter precision, including when a
 ``device_map`` places the backbone. The backbone and Pooling configuration are unchanged.
 Leaving ``compute_dtype`` unset preserves the usual behavior of matching the backbone dtype.
 
-An explicit later call such as ``model.bfloat16()`` still casts stored parameters. The
-projection uses its configured compute dtype, but cannot recover precision lost when
-the weights were cast. Prefer choosing the backbone dtype through ``model_kwargs`` during
-loading. Loading this configuration requires a Sentence Transformers version that supports
+Choose the backbone dtype through ``model_kwargs`` during loading. An explicit later call
+such as ``model.bfloat16()`` also casts the Dense parameters; forward raises an error if
+they no longer match ``compute_dtype``. Reloading with the intended dtype preserves the
+original weights; casting rounded weights back to FP32 cannot restore lost precision.
+Loading this configuration requires a Sentence Transformers version that supports
 ``compute_dtype``; older versions may ignore the setting or reject it.
 
 Constructing Custom Module Chains

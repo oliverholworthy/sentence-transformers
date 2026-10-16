@@ -11,7 +11,7 @@ from torch import nn
 from transformers import BertConfig, BertModel, BertTokenizer
 
 from sentence_transformers import CrossEncoder, SentenceTransformer
-from sentence_transformers.base.modules import Dense, Transformer
+from sentence_transformers.base.modules import Dense, Router, Transformer
 from sentence_transformers.sentence_transformer.modules import Pooling
 
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
@@ -43,9 +43,7 @@ def test_compute_dtype_matches_fp32_forward_and_gradients(
 ) -> None:
     torch.manual_seed(42)
     head = Dense(4, out_features, bias=bias, use_residual=use_residual, compute_dtype=torch.float32).to(device)
-    # A later explicit cast changes storage, but the projection still uses its configured compute dtype.
-    head.bfloat16()
-    reference = deepcopy(head).float()
+    reference = deepcopy(head)
     reference.compute_dtype = None
     inputs = torch.randn(2, 4, device=device, dtype=torch.bfloat16, requires_grad=True)
     reference_inputs = inputs.detach().float().requires_grad_()
@@ -60,7 +58,7 @@ def test_compute_dtype_matches_fp32_forward_and_gradients(
     for parameter, reference_parameter in zip(head.parameters(), reference.parameters()):
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
         assert parameter.grad.abs().sum() > 0
-        torch.testing.assert_close(parameter.grad, reference_parameter.grad.bfloat16(), rtol=0, atol=0)
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("compute_dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
@@ -97,16 +95,13 @@ def test_default_dense_keeps_legacy_config_and_autocast_behavior(tmp_path: Path)
     assert scores.dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("recast", [False, True])
-def test_compute_dtype_preserves_module_forward_hooks_and_activation_parameters(recast: bool) -> None:
+def test_compute_dtype_preserves_module_forward_hooks_and_activation_parameters() -> None:
     class OffsetLinear(nn.Linear):
         def forward(self, inputs):
             return super().forward(inputs) + 0.1
 
     head = Dense(4, 2, activation_function=nn.PReLU(), compute_dtype="float32")
     head.linear = OffsetLinear(4, 2)
-    if recast:
-        head.bfloat16()
     reference = deepcopy(head).float()
     reference.compute_dtype = None
     inputs = torch.tensor([[-1, 1, -2, 2]], dtype=torch.bfloat16)
@@ -121,7 +116,91 @@ def test_compute_dtype_preserves_module_forward_hooks_and_activation_parameters(
     actual.sum().backward()
     assert head.activation_function.weight.grad is not None
     assert torch.isfinite(head.activation_function.weight.grad).all()
-    assert head.linear.weight.dtype == (torch.bfloat16 if recast else torch.float32)
+    assert head.linear.weight.dtype == torch.float32
+
+
+@pytest.mark.parametrize("part", ["head", "activation", "residual"])
+def test_compute_dtype_rejects_incompatible_explicit_casts(part: str) -> None:
+    head = Dense(4, 2, activation_function=nn.PReLU(), use_residual=True, compute_dtype="float32")
+    module = {"head": head, "activation": head.activation_function, "residual": head.residual}[part]
+    module.bfloat16()
+    with pytest.raises(RuntimeError, match="Set the backbone dtype through model_kwargs"):
+        head({"sentence_embedding": torch.ones(2, 4, dtype=torch.bfloat16)})
+
+
+def test_compute_dtype_preserves_activation_running_statistics() -> None:
+    head = Dense(2, 2, bias=False, activation_function=nn.BatchNorm1d(2), compute_dtype="float32")
+    with torch.no_grad():
+        head.linear.weight.copy_(torch.eye(2))
+    reference = deepcopy(head)
+    reference.compute_dtype = None
+    inputs = torch.tensor([[2, 4], [4, 8]], dtype=torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = head({"sentence_embedding": inputs})["sentence_embedding"]
+    expected = reference({"sentence_embedding": inputs.float()})["sentence_embedding"]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for name, buffer in head.named_buffers():
+        torch.testing.assert_close(buffer, reference.state_dict()[name], rtol=0, atol=0)
+    assert head.activation_function.running_mean.abs().sum() > 0
+
+
+def test_compute_dtype_without_device_autocast_support(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unsupported_autocast(*args, **kwargs):
+        raise RuntimeError("User specified an unsupported autocast device_type")
+
+    # Older PyTorch versions reject MPS even with enabled=False. No context is needed there.
+    monkeypatch.setattr(torch, "autocast", unsupported_autocast)
+    head = Dense(2, 1, bias=False, activation_function=None, compute_dtype="float32")
+    inputs = torch.ones(2, 2, dtype=torch.bfloat16)
+    actual = head({"sentence_embedding": inputs})["sentence_embedding"]
+    torch.testing.assert_close(actual, F.linear(inputs.float(), head.linear.weight), rtol=0, atol=0)
+
+
+def test_compute_dtype_concurrent_inference_preserves_parameters() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    head = Dense(2, 1, activation_function=None, compute_dtype="float32")
+    inputs = torch.ones(2, 2, dtype=torch.bfloat16)
+    expected = head({"sentence_embedding": inputs})["sentence_embedding"].detach()
+    weight = head.linear.weight
+    barrier = Barrier(2, timeout=10)
+
+    def hook(module, args):
+        barrier.wait()
+        assert module.weight is weight
+
+    handle = head.linear.register_forward_pre_hook(hook)
+
+    def predict():
+        with torch.inference_mode(), torch.autocast("cpu", dtype=torch.bfloat16):
+            return head({"sentence_embedding": inputs})["sentence_embedding"]
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(predict) for _ in range(2)]
+            for future in futures:
+                torch.testing.assert_close(future.result(), expected, rtol=0, atol=0)
+    finally:
+        handle.remove()
+    assert head.linear.weight is weight
+
+
+@pytest.mark.parametrize("offload", ["cpu", "disk"])
+def test_compute_dtype_with_offloaded_linear(tmp_path: Path, offload: str) -> None:
+    from accelerate import cpu_offload, disk_offload
+
+    head = Dense(4, 1, activation_function=None, compute_dtype="float32")
+    inputs = torch.ones(2, 4, dtype=torch.bfloat16)
+    expected = head({"sentence_embedding": inputs})["sentence_embedding"].detach()
+    if offload == "cpu":
+        cpu_offload(head.linear, execution_device=torch.device("cpu"))
+    else:
+        disk_offload(head.linear, str(tmp_path), execution_device=torch.device("cpu"))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = head({"sentence_embedding": inputs})["sentence_embedding"]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert head.linear.weight.device.type == "meta"
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -149,6 +228,48 @@ def test_model_alignment_preserves_dense_weight_precision(nested: bool, delegate
         assert module[0].weight.dtype == torch.bfloat16
     for name, parameter in head.named_parameters():
         torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+@pytest.mark.parametrize("share_module", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_model_alignment_preserves_shared_dense_precision(delegated: bool, share_module: bool, reverse: bool) -> None:
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+    weights = torch.tensor([[0.1001, 0.2002, 0.3003, 0.4004]])
+    head = Dense(4, 1, bias=False, init_weight=weights.clone(), compute_dtype="float32")
+    head.linear.weight.grad = torch.full_like(weights, 0.1001)
+    ordinary = Dense(4, 1, bias=False)
+    if share_module:
+        ordinary.linear = head.linear
+    else:
+        ordinary.linear.weight = head.linear.weight
+    routes = {"query": [head], "document": [ordinary]}
+    if reverse:
+        routes = dict(reversed(list(routes.items())))
+    backbone = nn.Linear(4, 4, dtype=torch.bfloat16)
+    if delegated:
+        add_hook_to_module(backbone, AlignDevicesHook(execution_device="cpu"))
+    SentenceTransformer(modules=[backbone, Router(routes)], device="cpu")
+    assert head.linear.weight is ordinary.linear.weight
+    torch.testing.assert_close(head.linear.weight, weights, rtol=0, atol=0)
+    torch.testing.assert_close(head.linear.weight.grad, torch.full_like(weights, 0.1001), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+def test_model_alignment_rejects_conflicting_shared_dtypes(delegated: bool) -> None:
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+    first = Dense(4, 1, compute_dtype="float32")
+    second = Dense(4, 1, compute_dtype="float64")
+    second.linear.weight = first.linear.weight
+    expected = first.linear.weight.detach().clone()
+    backbone = nn.Linear(4, 4, dtype=torch.bfloat16)
+    if delegated:
+        add_hook_to_module(backbone, AlignDevicesHook(execution_device="cpu"))
+    with pytest.raises(ValueError, match="sharing tensors must use the same compute_dtype"):
+        SentenceTransformer(modules=[backbone, first, second], device="cpu")
+    torch.testing.assert_close(first.linear.weight, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device_map", [None, {"": "cpu"}])

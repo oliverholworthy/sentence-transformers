@@ -14,7 +14,7 @@ import traceback
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
-from functools import cached_property, partial
+from functools import cached_property
 from itertools import chain
 from multiprocessing import Queue
 from pathlib import Path
@@ -282,8 +282,19 @@ class BaseModel(nn.Sequential, PeftAdapterMixin, ABC):
         else:
             first_param = next(self[0].parameters(), None)
             if first_param is not None:
+                dtype = first_param.dtype
+                dtype_overrides = self._get_dense_dtype_overrides()
                 for module in list(self.children())[1:]:
-                    self._cast_module_dtype(module, first_param.dtype)
+                    if dtype_overrides:
+                        module._apply(
+                            lambda tensor: (
+                                tensor.to(dtype_overrides.get(tensor, dtype))
+                                if tensor.is_floating_point() or tensor.is_complex()
+                                else tensor
+                            )
+                        )
+                    else:
+                        module.to(dtype)
             self.to(device)
         self.is_hpu_graph_enabled = False
 
@@ -1541,22 +1552,19 @@ This pull request has been automatically generated to add {self.__class__.__name
                 except TypeError:
                     module.gradient_checkpointing_enable()
 
-    @staticmethod
-    def _cast_module_dtype(module: nn.Module, dtype: torch.dtype) -> None:
-        """Align a module with the backbone while respecting configured Dense precision."""
-        if isinstance(module, Dense) and module.compute_dtype is not None:
-            module.to(module.compute_dtype)
-        elif any(isinstance(child, Dense) and child.compute_dtype is not None for child in module.modules()):
-            # A container can hold both ordinary modules and a Dense with its own dtype.
-            # Casting the whole container first would irreversibly round the Dense weights.
-            for child in module.children():
-                BaseModel._cast_module_dtype(child, dtype)
-            module._apply(
-                lambda tensor: tensor.to(dtype) if tensor.is_floating_point() or tensor.is_complex() else tensor,
-                recurse=False,
-            )
-        else:
-            module.to(dtype)
+    def _get_dense_dtype_overrides(self) -> dict[Tensor, torch.dtype]:
+        """Resolve Dense precision before casting, including tensors shared by multiple modules."""
+        overrides = {}
+        for module in self.modules():
+            if isinstance(module, Dense) and module.compute_dtype is not None:
+                for tensor in chain(module.parameters(), module.buffers()):
+                    if tensor.is_floating_point() or tensor.is_complex():
+                        if tensor in overrides and overrides[tensor] != module.compute_dtype:
+                            raise ValueError("Dense modules sharing tensors must use the same compute_dtype.")
+                        overrides[tensor] = module.compute_dtype
+                        if isinstance(tensor, nn.Parameter) and tensor.grad is not None:
+                            overrides[tensor.grad] = module.compute_dtype
+        return overrides
 
     def _place_modules(self) -> None:
         """Align auxiliary modules without changing backbones or dispatched submodules."""
@@ -1565,12 +1573,7 @@ This pull request has been automatically generated to add {self.__class__.__name
         dtype = first_param.dtype if first_param is not None else None
         modules = list(self.modules())
         protected: set[nn.Module] = set()
-        dtype_overrides = {
-            child: module.compute_dtype
-            for module in modules
-            if isinstance(module, Dense) and module.compute_dtype is not None
-            for child in module.modules()
-        }
+        dtype_overrides = self._get_dense_dtype_overrides()
 
         def collect_hook(module: nn.Module, hook: ModelHook | None) -> None:
             if getattr(hook, "execution_device", None) is not None:
@@ -1588,18 +1591,20 @@ This pull request has been automatically generated to add {self.__class__.__name
                 protected.update(module.modules())
             collect_hook(module, module.__dict__.get("_hf_hook"))
 
-        def convert(tensor: Tensor, target_dtype: torch.dtype | None) -> Tensor:
+        def convert(tensor: Tensor) -> Tensor:
             return tensor.to(
-                device=device, dtype=target_dtype if tensor.is_floating_point() or tensor.is_complex() else None
+                device=device,
+                dtype=dtype_overrides.get(tensor, dtype)
+                if tensor.is_floating_point() or tensor.is_complex()
+                else None,
             )
 
         for module in reversed(modules):
             if module not in protected:
-                convert_module = partial(convert, target_dtype=dtype_overrides.get(module, dtype))
                 if isinstance(module, BaseModel):
-                    super(BaseModel, module)._apply(convert_module, recurse=False)
+                    super(BaseModel, module)._apply(convert, recurse=False)
                 else:
-                    module._apply(convert_module, recurse=False)
+                    module._apply(convert, recurse=False)
 
     @torch.inference_mode(False)
     def _resolve_inference_device(self, device: int | str | torch.device | None) -> torch.device:

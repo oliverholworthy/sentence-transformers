@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from itertools import chain
 from typing import Any
 
@@ -41,14 +42,14 @@ class Dense(Module):
         use_residual: If True, add a residual connection from the input to the projected output.
             When ``in_features != out_features``, the residual is projected through a separate
             ``nn.Linear(in_features, out_features, bias=False)``. Defaults to False.
-        compute_dtype: Optional dtype for the projection, activation, and residual connection,
+        compute_dtype: Optional dtype for the parameters, computation, and output of this module,
             independent of the backbone dtype. Accepts ``torch.float32`` or a string such as
-            ``"float32"`` (also ``float16``, ``bfloat16``, and ``float64``). When set, inputs and
-            projection weights are cast to this dtype and autocast is disabled inside this module.
-            Model loading keeps this module's parameters in the requested dtype. Explicit later
-            calls such as ``model.bfloat16()`` can still change stored parameters; promoting them
-            during computation cannot recover precision lost by such a cast. Defaults to None,
-            which preserves the model's usual dtype and autocast behavior.
+            ``"float32"`` (also ``float16``, ``bfloat16``, and ``float64``). When set, inputs are
+            cast to this dtype and autocast is disabled inside this module. Model loading preserves
+            the requested parameter dtype. Explicit later casts such as ``model.bfloat16()``
+            that change this dtype cause forward to raise an error. Subsequent modules must
+            accept this module's output dtype.
+            Defaults to None, which preserves the model's usual dtype and autocast behavior.
     """
 
     config_keys: list[str] = [
@@ -109,39 +110,30 @@ class Dense(Module):
 
     def forward(self, features: dict[str, Tensor]):
         x = features[self.module_input_name]
-        if self.compute_dtype is None:
+        context = nullcontext()
+        if self.compute_dtype is not None:
+            if any(
+                tensor.is_floating_point() and tensor.dtype != self.compute_dtype
+                for tensor in chain(self.parameters(), self.buffers())
+            ):
+                raise RuntimeError(
+                    f"Dense(compute_dtype={self.compute_dtype}) requires its floating-point parameters and buffers "
+                    f"to remain in {self.compute_dtype}. Set the backbone dtype through model_kwargs instead "
+                    "of casting the entire model."
+                )
+            x = x.to(self.compute_dtype)
+            try:
+                context = torch.autocast(device_type=x.device.type, enabled=False)
+            except RuntimeError:
+                # Some devices have no autocast support in older PyTorch versions (e.g. MPS in 2.2).
+                pass
+        with context:
             out = self.activation_function(self.linear(x))
             if self.use_residual:
                 residual = x if self.in_features == self.out_features else self.residual(x)
                 out = out + residual
-        else:
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                x = x.to(self.compute_dtype)
-                out = self._forward_in_compute_dtype(
-                    self.activation_function, self._forward_in_compute_dtype(self.linear, x)
-                )
-                if self.use_residual:
-                    residual = (
-                        x
-                        if self.in_features == self.out_features
-                        else self._forward_in_compute_dtype(self.residual, x)
-                    )
-                    out = out + residual
         features[self.module_output_name] = out
         return features
-
-    def _forward_in_compute_dtype(self, module: Callable[[Tensor], Tensor], inputs: Tensor) -> Tensor:
-        if isinstance(module, nn.Module):
-            state = {
-                name: tensor.to(self.compute_dtype)
-                for name, tensor in chain(module.named_parameters(), module.named_buffers())
-                if tensor.is_floating_point() and tensor.dtype != self.compute_dtype
-            }
-            if state:
-                # Preserve the module's forward and hooks, including parameterized activations.
-                # Casting the tensors remains differentiable without mutating stored parameters.
-                return torch.func.functional_call(module, state, (inputs,))
-        return module(inputs)
 
     def get_embedding_dimension(self) -> int:
         return self.out_features
